@@ -1,0 +1,14 @@
+{
+  "dataset": "data/box",
+  "robot_assets": "data/robot",
+  "object_assets": "data/objects",
+  "goal_mode": "flow",
+  "action_mode": "absolute",
+  "num_envs": 1024,
+  "wm_batch": 2048,
+  "pi_batch": 2048,
+  "iterations": 20000,
+  "save_every": 2500,
+  "log_dir": "logs/box",
+  "lr_decay_ret": 0.9
+}
