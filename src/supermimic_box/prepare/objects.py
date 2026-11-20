@@ -24,7 +24,9 @@ TORSIONAL_FRICTION, ROLLING_FRICTION = 0.005, 0.0001
 # Per kind of use: nominal mass [kg] and range of the sliding friction against ground and platforms.
 # Every box weighs 2 kg, as in OmniContact's training: the pushed boxes are large but are also
 # lifted by hand in the carry-then-push clips.
-KINDS = {"box": dict(mass=2.0, friction=(0.4, 0.7)), "push": dict(mass=2.0, friction=(0.15, 0.35))}
+# The friction ranges span OmniContact's dynamic to static friction (0.3 to 0.8 for carried boxes,
+# 0.1 to 0.4 for pushed ones).
+KINDS = {"box": dict(mass=2.0, friction=(0.3, 0.8)), "push": dict(mass=2.0, friction=(0.1, 0.4))}
 
 
 def box_name(half, kind: str) -> str:

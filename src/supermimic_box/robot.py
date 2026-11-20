@@ -35,7 +35,16 @@ FRICTION_RANGE = (0.6, 1.2)
 COM_RANGE = ((-0.025, 0.025), (-0.05, 0.05), (-0.05, 0.05))
 JOINT_OFFSET = 0.01
 NOISE_JOINT_POS, NOISE_JOINT_VEL, NOISE_ANG_VEL, NOISE_GRAVITY, NOISE_REF_ORI = 0.01, 0.5, 0.2, 0.05, 0.05
-NOISE_OBJECT_POS, NOISE_OBJECT_ORI = 0.02, 0.05
+# Localization of the robot [m], and the box pose as mocap or vision would give it: position [m] and
+# a rotation about each axis [rad]. Every box feature is computed from the same noisy pose.
+NOISE_ROOT_POS, NOISE_OBJECT_POS, NOISE_OBJECT_ORI = 0.05, 0.05, 0.1
+# PD gains: stiffness and damping of every joint scaled log-uniformly in this range, once per
+# episode (OmniContact). Orientation estimate: a fixed roll, pitch, yaw error [rad] of the robot's
+# root orientation per episode, as OmniContact's torso orientation bias (5, 5, 8 degrees). It
+# affects what the robot knows of its pose relative to the reference and the box, not the IMU's
+# gravity and angular velocity.
+GAIN_RANGE = (0.75, 1.5)
+ORIENTATION_BIAS = (0.0873, 0.0873, 0.1396)
 
 CONTACT_CHANNELS = ("left_foot", "right_foot", "left_hand", "right_hand")
 
@@ -58,6 +67,10 @@ MOTORS = {
     "wrist_pitch": (5.0, ARMATURE_4010),
     "wrist_yaw": (5.0, ARMATURE_4010),
 }
+
+
+# Drive sets. "sonic": the hip pitch joints use the larger actuator, as the SONIC tracker was trained.
+DRIVES = {"omnicontact": {}, "sonic": {"hip_pitch": (139.0, ARMATURE_7520_22)}}
 
 
 @dataclass(frozen=True)
@@ -119,11 +132,19 @@ class Robot:
         "right_shoulder_pitch_joint": 0.2,
     }
 
-    def __init__(self, asset_dir: str | Path):
-        self.asset_dir = Path(asset_dir)
+    def __init__(self, asset_dir: str | Path, drives: str = "omnicontact"):
+        if drives not in DRIVES:
+            raise ValueError(f"drives must be one of {tuple(DRIVES)}")
+        self.asset_dir, self.drives = Path(asset_dir), drives
+        self.motors = {**MOTORS, **DRIVES[drives]}
 
     def drive(self, joint: str) -> Drive:
-        return motor_drive(*MOTORS[side_joint(joint)])
+        return motor_drive(*self.motors[side_joint(joint)])
+
+    @cached_property
+    def arm_idx(self) -> list[int]:
+        """Joints of the arms: shoulders, elbows and wrists."""
+        return [i for i, n in enumerate(self.joint_names) if side_joint(n).split("_")[0] in ("shoulder", "elbow", "wrist")]
 
     def contact_channel(self, body: str) -> int:
         """Channel of CONTACT_CHANNELS that a link's contacts with the object count for, or -1."""
@@ -203,5 +224,5 @@ class Robot:
         )
 
 
-def load_robot(asset_dir: str | Path) -> Robot:
-    return Robot(asset_dir)
+def load_robot(asset_dir: str | Path, drives: str = "omnicontact") -> Robot:
+    return Robot(asset_dir, drives)

@@ -49,6 +49,8 @@ def robot_signature(robot) -> str:
     meshes = sorted(path for path in (robot.asset_dir / "meshes").rglob("*") if path.is_file())
     for file in meshes:
         digest.update(hashlib.sha256(file.read_bytes()).digest())
+    if robot.drives != "omnicontact":
+        digest.update(robot.drives.encode())
     return digest.hexdigest()
 
 
@@ -182,7 +184,7 @@ class CPUPhysics:
                   for k, d in zip(self.assignment, self.data)]  # fmt: skip
         return tuple(torch.stack([s[i] for s in states]) for i in range(10))
 
-    def reset(self, mask, state, objects, tables, mass_scale=None, friction=None):
+    def reset(self, mask, state, objects, tables, mass_scale=None, friction=None, gains=None):
         for e in mask.nonzero().flatten().tolist():
             k = int(objects[e])
             if k != self.assignment[e]:
@@ -247,7 +249,8 @@ class WarpPhysics:
                               variant_info=scene.collect_variant_info(), device=cfg.device)  # fmt: skip
         if cfg.nccdmax is not None:
             self.sim.wp_data.naccdmax = cfg.nccdmax * self.N  # convex-collision workspace only
-        self.sim.expand_model_fields((*OBJECT_GEOM_FIELDS, *OBJECT_BODY_FIELDS, "geom_friction", "body_ipos"))
+        self.sim.expand_model_fields((*OBJECT_GEOM_FIELDS, *OBJECT_BODY_FIELDS, "geom_friction", "body_ipos",
+                                      "actuator_gainprm", "actuator_biasprm"))
         model = self.sim.mj_model
         self.idx = Indexing(model, robot).to(cfg.device)
         # The rows that make a world's box what it is, read from a host model compiled with each box.
@@ -268,6 +271,10 @@ class WarpPhysics:
         self._mass = torch.tensor([float(h.body_mass[body]) for h in hosts], device=cfg.device)
         self._position = torch.full((len(registry["objects"]),), -1, device=cfg.device)  # registry index -> row of the tables
         self._position[torch.tensor(objects, device=cfg.device)] = torch.arange(len(objects), device=cfg.device)
+        # Position actuators: force = kp * ctrl - kp * q - kd * qd, so kp sits in gainprm[0] and -kp, -kd in biasprm[1:3].
+        self._gainprm, self._biasprm = wp.to_torch(self.sim.wp_model.actuator_gainprm), wp.to_torch(self.sim.wp_model.actuator_biasprm)
+        self._kp, self._kd = self._gainprm[0, self.idx.ctrl, 0].clone(), -self._biasprm[0, self.idx.ctrl, 2].clone()
+        self.gain_scale = torch.ones(self.N, len(robot.joint_names), 2, device=cfg.device)
         self.held = torch.zeros(self.N, dtype=torch.long, device=cfg.device)  # table row of the box every world holds
         self.mass_scale = torch.ones(self.N, device=cfg.device)
         self.friction = torch.full((self.N,), float(model.geom_friction[geoms[0], 0]), device=cfg.device)
@@ -340,10 +347,11 @@ class WarpPhysics:
             rows[:, columns] = value
         self._friction[:, self._object_geoms, 0] = self.friction[:, None]
 
-    def reset(self, mask, state, objects, tables, mass_scale, friction):
+    def reset(self, mask, state, objects, tables, mass_scale, friction, gains=None):
         """Set the worlds where ``mask`` is true to ``state`` and give them the boxes ``objects`` (N,)
         (registry indices) with mass scale ``mass_scale`` (N,) and sliding friction ``friction`` (N,),
-        and the platforms at ``tables`` (N, 6); the others keep theirs."""
+        the platforms at ``tables`` (N, 6) and the stiffness and damping scales ``gains`` (N, J, 2);
+        the others keep theirs."""
         import mujoco_warp as mjwarp
         import warp as wp
 
@@ -352,6 +360,12 @@ class WarpPhysics:
         self.mass_scale.copy_(torch.where(mask, mass_scale, self.mass_scale))
         self.friction.copy_(torch.where(mask, friction, self.friction))
         self._write_objects()
+        if gains is not None:
+            self.gain_scale.copy_(torch.where(mask[:, None, None], gains, self.gain_scale))
+            kp, kd = self._kp * self.gain_scale[..., 0], self._kd * self.gain_scale[..., 1]
+            self._gainprm[:, self.idx.ctrl, 0] = kp
+            self._biasprm[:, self.idx.ctrl, 1] = -kp
+            self._biasprm[:, self.idx.ctrl, 2] = -kd
         wp.to_torch(sim._reset_mask_wp).copy_(mask)
         with wp.ScopedDevice(sim.wp_device):
             if sim.use_cuda_graph and sim.reset_graph is not None:

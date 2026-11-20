@@ -18,6 +18,7 @@ from .learning import actor_objective, bounded_bootstrap, discounted_return_boun
 from .mdp import FAILURE_REASONS, feet_step
 from .networks import Actor, ContactRewardHead, Critic, RunningNorm, WorldModel
 from .optim import MuonAdam, load_optimizer, make_adam
+from .sonic import SonicBase
 from .state import unpack
 from .tracking import Tracker
 
@@ -51,6 +52,13 @@ class Runner:
         self.actor = Actor(env.history.shape[-1], self.motion.goal_dim(cfg.future), self.task.robot.num_actions,
                            cfg.history, cfg.policy_hidden).to(cfg.device)  # fmt: skip
         self.ema = copy.deepcopy(self.actor).requires_grad_(False)
+        # A frozen base policy; the actor's output is then a residual on its action.
+        self.base = None
+        if cfg.base_policy == "sonic":
+            self.base = SonicBase(cfg.base_checkpoint, self.motion, self.task.robot.joint_names, J).to(cfg.device)
+        # Per-joint scale of the residual: full on the arms, ``leg_residual_scale`` on legs and waist.
+        self.residual_scale = torch.full((J,), cfg.leg_residual_scale, device=cfg.device)
+        self.residual_scale[self.task.robot.arm_idx] = 1.0
         with torch.no_grad():
             critic_dim = self.mdp.critic_input(env.physics.state(), env.f, env.previous_action, env.context,
                                                self.motion.goal(env.f, cfg.future), env.feet).shape[-1]  # fmt: skip
@@ -100,13 +108,22 @@ class Runner:
             self._critic_update = CUDACall(self.critic_update, pool=pool, capture_after=self._critic_batch)
 
     # ------------------------------------------------------------------ collection
+    def policy_action(self, actor, history, goal, z, root_R, frames, context):
+        """The action of ``actor`` for an observation history at reference frames ``frames``: its output,
+        added to the base policy's action where there is one. ``root_R``: the robot's true root rotation,
+        of which the base policy sees the biased estimate."""
+        action = actor(history, goal, z)
+        if self.base is None:
+            return action
+        return self.base(history, self.mdp.observed_root(root_R, context), frames) + self.residual_scale * action
+
     @torch.no_grad()
-    def act(self, history, frames):
-        """The actor's action and the exploration noise to execute it with."""
+    def act(self, history, frames, root_R, context):
+        """The policy's action and the exploration noise to execute it with."""
         goal = self.motion.goal(frames, self.cfg.future)
         self.actor.obs_norm.update(history[:, -1])
         self.actor.goal_norm.update(goal)
-        action = self.actor(history, goal)
+        action = self.policy_action(self.actor, history, goal, None, root_R, frames, context)
         return action, self.cfg.exploration * torch.randn_like(action)
 
     @torch.no_grad()
@@ -123,7 +140,7 @@ class Runner:
     def collect_step(self):
         """One fixed-shape control step of every world, including resets and randomization."""
         env = self.env
-        row = env.step(*self._act(env.history, env.f))
+        row = env.step(*self._act(env.history, env.f, env.physics.state()[1], env.context))
         ok = env.physics.ok
         # After a fatal fault keep the evidence in place: no resets, and nothing is admitted.
         env.reset(row["cut"] & ok)
@@ -239,7 +256,7 @@ class Runner:
         extra = self.mdp.model_features(s, f, context)
 
         qref = self.motion.q[f1]
-        action = self.control.bound_action(self.actor(history, goal, z), qref)
+        action = self.control.bound_action(self.policy_action(self.actor, history, goal, z, s[1], f, context), qref)
         u = self.control.effective(self.control(action, qref, self.mdp.layout.offsets(context)))
         contact, foot_contact = self.reward_head(s, u, extra).split((4, 2), -1)
         shortfall, feet = feet_step(feet, foot_contact, self.cfg.reward.feet_air_time_threshold)
@@ -247,7 +264,7 @@ class Runner:
         fk = self.mdp.fk(s)
         reward, _ = self.mdp.reward(s, f1, action, previous, contact, foot_contact, shortfall, episode_start, context, fk)
         done = self.mdp.soft_termination(s, f1, fk)
-        obs = self.mdp.add_noise(self.mdp.obs(s, f1, action, context, fk))
+        obs = self.mdp.obs(s, f1, action, context, fk, noise=True)
         history = torch.cat((history[:, 1:], obs[:, None]), 1)
 
         s_b, previous_b, history_b, fk_b, feet_b = before

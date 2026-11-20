@@ -8,10 +8,11 @@ reference throughout, reproduced at least MIN_MOTION_COVERAGE of the reference o
 was raised if the reference raises it. Termination only bounds how far an episode may drift;
 success says the interaction happened. Contact is neither, so the report also gives the fraction of
 intended contact steps (per hand or foot) with measured object contact. No exploration noise,
-observation noise or domain randomization is applied.
+observation noise or domain randomization is applied unless `--randomize` asks for the training randomization.
 
-``quality`` describes the motion itself: how much the feet slide and tap, how hard they land, and
-how busy the joints and actions are.
+``quality`` describes the motion itself: how much the feet slide and tap, how hard they land, how
+busy the joints and actions are, how far the feet are from their reference and how often each
+foot is on the ground exactly when the reference has it there.
 """
 
 from __future__ import annotations
@@ -39,12 +40,15 @@ MIN_LIFT_STEPS = 10  # reference steps above LIFT_HEIGHT that make raising part 
 SUCCESS_CRITERIA = ("object_position", "object_rotation", "motion_coverage", "lift")
 
 
-def load_runner(checkpoint: str, **overrides) -> Runner:
-    """Rebuild the checkpoint's networks on one world per clip, without randomization or capture."""
+def load_runner(checkpoint: str, randomize: bool = False, seed: int | None = None, **overrides) -> Runner:
+    """Rebuild the checkpoint's networks on one world per clip, without capture; with ``randomize`` the
+    training randomization and observation noise apply (drawn from ``seed``)."""
     saved = torch.load(checkpoint, map_location="cpu", weights_only=False)["config"]
     saved = {k: v for k, v in saved.items() if k in {f.name for f in fields(TrainConfig)}}
     saved.update({k: v for k, v in overrides.items() if v is not None})
-    saved.update(randomize=False, compile=False, cuda_graph=False, resume="", swanlab_mode="disabled")
+    saved.update(randomize=randomize, compile=False, cuda_graph=False, resume="", swanlab_mode="disabled")
+    if seed is not None:
+        saved["seed"] = seed
     cfg = TrainConfig(**saved)
     if cfg.device == "cpu":
         cfg.backend = "cpu"
@@ -72,22 +76,26 @@ def evaluate(runner: Runner, record=()) -> tuple[dict, dict]:
     contact = torch.zeros(N, 2, device=device)  # (intended contact steps with contact, intended contact steps)
     reasons = torch.zeros(N, len(FAILURE_REASONS), dtype=torch.bool, device=device)
     c = cfg.reward
-    # Sums over the active steps: foot slide, swings shorter than the threshold, squared action change, joint speed.
-    motion = torch.zeros(N, 4, device=device)
+    # Sums over the active steps: foot slide, swings shorter than the threshold, squared action change, joint speed,
+    # foot position error, feet whose ground contact matches the reference's stance.
+    motion = torch.zeros(N, 6, device=device)
     foot_peak = torch.zeros(N, device=device)
     previous = env.previous_action.clone()
     completed = torch.zeros(N, dtype=torch.bool, device=device)
     recorded = {name: [pack(env.physics.state())[m.names.index(name)].cpu()] for name in record}
     while bool(active.any()):
         before = env.physics.state()[6:8]
-        row = env.step(runner.ema(env.history, m.goal(env.f, cfg.future)))
+        row = env.step(runner.policy_action(runner.ema, env.history, m.goal(env.f, cfg.future), None, env.physics.state()[1], env.f,
+                                            env.context))
         env.physics.check()
         s, f = env.physics.state(), env.f
         body, _, velocity, _ = mdp.fk(s)
         slide = (velocity[:, mdp.feet, :2].norm(dim=-1) * row["foot_contact"]).sum(-1)
         taps = (feet_step(row["feet"], row["foot_contact"], c.feet_air_time_threshold)[0] > 0).float().sum(-1)
         change = (row["action"] - previous).square().sum(-1)
-        motion += torch.where(active[:, None], torch.stack((slide, taps, change, s[5].abs().mean(-1)), -1), 0.0)
+        foot_error = (body[:, mdp.feet] - m.body_p[f][:, mdp.feet]).norm(dim=-1).mean(-1)
+        stance = (row["foot_contact"] == m.stance[f]).float().mean(-1)
+        motion += torch.where(active[:, None], torch.stack((slide, taps, change, s[5].abs().mean(-1), foot_error, stance), -1), 0.0)
         foot_peak = torch.where(active, torch.maximum(foot_peak, row["foot_force"].amax(-1)), foot_peak)
         previous = row["action"]
         errors = torch.stack(((s[6] - m.object_p[f]).norm(dim=-1), angle_squared(s[7], m.object_R[f]).sqrt(),
@@ -138,6 +146,7 @@ def evaluate(runner: Runner, record=()) -> tuple[dict, dict]:
             intended_contact_coverage=float(contact[i, 0] / contact[i, 1]) if contact[i, 1] > 0 else None,
             foot_slide_m_per_s=float(motion[i, 0]) / n, short_swings_per_s=float(motion[i, 1] / seconds[i]),
             action_change=float(motion[i, 2]) / n, joint_speed_rad_per_s=float(motion[i, 3]) / n,
+            foot_position_error_m=float(motion[i, 4]) / n, stance_agreement=float(motion[i, 5]) / n,
             peak_foot_force_n=float(foot_peak[i])))  # fmt: skip
     progress = (steps / reference_steps).numpy()
     coverage = [r["intended_contact_coverage"] for r in results if r["intended_contact_coverage"] is not None]
@@ -145,7 +154,8 @@ def evaluate(runner: Runner, record=()) -> tuple[dict, dict]:
     for r in results:
         per_task.setdefault(r["task"], []).append((r["success"], r["completed"]))
     quality = {key: float(np.mean([r[key] for r in results])) for key in
-               ("foot_slide_m_per_s", "short_swings_per_s", "action_change", "joint_speed_rad_per_s", "peak_foot_force_n")}  # fmt: skip
+               ("foot_slide_m_per_s", "short_swings_per_s", "action_change", "joint_speed_rad_per_s", "peak_foot_force_n",
+                "foot_position_error_m", "stance_agreement")}  # fmt: skip
     report = dict(iteration=runner.iteration, dataset=cfg.dataset, split=cfg.split, clips=len(results), success_rate=float(success.float().mean()),
                   completion_rate=float(completed.float().mean()), mean_progress=float(progress.mean()),
                   mean_object_motion_coverage=float(covered.mean()),
@@ -165,11 +175,13 @@ def main():
     p.add_argument("--clips", nargs="+", help="Evaluate only these clips")
     p.add_argument("--split", help="Evaluate the clips of this split instead of the clips the checkpoint trained on")
     p.add_argument("--record", nargs="+", default=[], help="Save the state trajectory of these clips")
+    p.add_argument("--randomize", action="store_true", help="Evaluate under the training randomization and observation noise")
+    p.add_argument("--seed", type=int, help="Seed of the randomization (default: the checkpoint's)")
     p.add_argument("--output", default="results/evaluation.json")
     p.add_argument("--threads", type=int, default=4)
     a = p.parse_args()
     torch.set_num_threads(a.threads)
-    runner = load_runner(a.checkpoint, device=a.device, dataset=a.dataset, robot_assets=a.robot_assets,
+    runner = load_runner(a.checkpoint, a.randomize, a.seed, device=a.device, dataset=a.dataset, robot_assets=a.robot_assets,
                          object_assets=a.object_assets, clips=a.clips or ([] if a.split else None), split=a.split)  # fmt: skip
     report, trajectories = evaluate(runner, a.record)
     out = Path(a.output)

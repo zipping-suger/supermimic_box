@@ -19,6 +19,27 @@ ROTATION_LENGTH = 0.15  # metres that one radian of object rotation counts for i
 FUTURE_OFFSETS = (1, 2, 3, 4, 8, 12, 16, 24, 32, 50)
 KEY_SCALE = 0.2  # box half extents are given to the networks in units of this length [m]
 GOAL_MODES = ("flow", "full")
+# A reference foot swings while its ankle travels faster than SWING_SPEED over the ground. Flicker
+# shorter than STANCE_SMOOTHING control steps is voted away, and a swing shorter than SWING_MIN_STEPS
+# counts as stance: a shuffle of the feet, not a step. The height of the reference's sole says little:
+# the retargeted heel-to-toe roll keeps a corner of the robot's long foot within a centimetre of
+# the ground through most steps, which a simulated foot cannot do without scuffing.
+SWING_SPEED, STANCE_SMOOTHING, SWING_MIN_STEPS = 0.3, 5, 10
+
+
+def reference_stance(speed):
+    """(frames, feet) whether each foot of one clip stands on the ground, from the horizontal speed
+    of its ankle (frames, feet)."""
+    raw = (speed < SWING_SPEED).float()
+    k = STANCE_SMOOTHING
+    padded = torch.nn.functional.pad(raw.T[None], (k // 2, k // 2), mode="replicate")
+    stance = (torch.nn.functional.avg_pool1d(padded, k, stride=1)[0].T > 0.5).numpy()
+    for foot in range(stance.shape[1]):
+        edges = np.diff(np.concatenate(([1], stance[:, foot].astype(int), [1])))
+        for lift, land in zip(np.flatnonzero(edges == -1), np.flatnonzero(edges == 1)):
+            if land - lift < SWING_MIN_STEPS:
+                stance[lift:land, foot] = True
+    return torch.from_numpy(stance).float()
 
 
 def select_clips(dataset: str | Path, clips=(), split: str = "") -> list[str]:
@@ -49,7 +70,8 @@ class Motion:
     Robot and object share one world frame and are never re-anchored independently. Joint
     references are projected onto the joint limits before velocities and FK are derived, so every
     reference state is a feasible reset. ``contact`` is reference intent, not a measurement: whether
-    the left foot, right foot, left hand and right hand are on the object.
+    the left foot, right foot, left hand and right hand are on the object. ``stance`` is the same
+    for the left and right foot on the ground, derived from when the reference's feet travel.
     """
 
     def __init__(self, dataset: str | Path, robot: Robot, objects: list[dict], device: str = "cpu", clips=(),
@@ -126,6 +148,9 @@ class Motion:
 
         Rt = self.root_R.transpose(-1, -2)
         self.root_v_local, self.root_w_local = mv3(Rt, self.root_v), mv3(Rt, self.root_w)
+        # Reference intent for the feet on the ground, like ``contact`` for the object.
+        foot_speed = self.body_v[:, self.feet, :2].norm(dim=-1).cpu()
+        self.stance = to(torch.cat([reference_stance(v) for v in foot_speed.split(lengths)]))
         self.contact = to(arrays["contact"].float())
         if self.contact.shape[-1] != len(CONTACT_CHANNELS):
             raise ValueError("Contact flags must cover the four contact channels")

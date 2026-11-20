@@ -1,10 +1,13 @@
 """Domain randomization and the privileged simulation context.
 
 The context seen by the world model, contact head and critic is, in order: the object's mass and
-sliding friction, the robot parameters xi = [friction, encoder offsets, torso CoM offset] (all
-normalized), and the world positions of the two support platforms. The actor never sees it.
-Robot friction and CoM are drawn once per world; encoder offsets, object mass and object friction
-once per episode.
+sliding friction, the robot parameters xi = [foot friction, encoder offsets, torso CoM offset,
+log stiffness and log damping scales of every joint, orientation-estimate bias] (all normalized),
+and the world positions of the two support platforms. The actor never sees it.
+
+Drawn once per world: foot friction and torso CoM. Once per episode: encoder offsets, PD gains,
+the orientation bias, the object's mass and its friction. Random pushes are not used: the world
+model would have to predict an external force it cannot see.
 
 Friction in MuJoCo is the larger one of a contact pair. The ground and the platforms get almost
 none, so the robot's friction is that of its feet on the ground, the object's friction that of the
@@ -13,36 +16,54 @@ object on the ground, and a hand on the object gets the larger of the two.
 
 from __future__ import annotations
 
+import math
+
 import mujoco
 import numpy as np
 import torch
 
-from .robot import COM_RANGE, FRICTION_RANGE, JOINT_OFFSET, Robot
+from .robot import COM_RANGE, FRICTION_RANGE, GAIN_RANGE, JOINT_OFFSET, ORIENTATION_BIAS, Robot
 
 OBJECT_CONTEXT = 2  # mass, sliding friction
 TABLES = 6
 SUPPORT_FRICTION = 0.01  # ground and platforms
 MASS_SCALE, FRICTION_CENTER, FRICTION_SCALE = 4.0, 0.5, 0.3
+LOG_GAIN = tuple(math.log(x) for x in GAIN_RANGE)
 
 
 class ContextLayout:
     def __init__(self, robot: Robot, device: str):
         J = robot.num_joints
+        self.J = J
         self.friction, self.joint_offset, self.com = slice(0, 1), slice(1, 1 + J), slice(1 + J, 4 + J)
-        self.xi_dim = 4 + J
+        self.stiffness, self.damping, self.bias = slice(4 + J, 4 + 2 * J), slice(4 + 2 * J, 4 + 3 * J), slice(4 + 3 * J, 7 + 3 * J)
+        self.xi_dim = 7 + 3 * J
         self.model_dim = OBJECT_CONTEXT + self.xi_dim
         self.dim = self.model_dim + TABLES
         lo, hi = FRICTION_RANGE
-        self.center = torch.tensor([(lo + hi) / 2] + [0.0] * (J + 3), device=device)
-        self.scale = torch.tensor([(hi - lo) / 2] + [JOINT_OFFSET] * J + [0.05] * 3, device=device)
+        gain_center, gain_scale = (LOG_GAIN[0] + LOG_GAIN[1]) / 2, (LOG_GAIN[1] - LOG_GAIN[0]) / 2
+        self.center = torch.tensor([(lo + hi) / 2] + [0.0] * (J + 3) + [gain_center] * (2 * J) + [0.0] * 3, device=device)
+        self.scale = torch.tensor([(hi - lo) / 2] + [JOINT_OFFSET] * J + [0.05] * 3 + [gain_scale] * (2 * J) + list(ORIENTATION_BIAS),
+                                  device=device)  # fmt: skip
 
     def normalize(self, xi):
         return (xi - self.center) / self.scale
 
+    def xi(self, context):
+        return context[..., OBJECT_CONTEXT : self.model_dim] * self.scale + self.center
+
     def offsets(self, context):
         """Encoder offsets in radians from a full context row."""
-        xi = context[..., OBJECT_CONTEXT : self.model_dim] * self.scale + self.center
-        return xi[..., self.joint_offset]
+        return self.xi(context)[..., self.joint_offset]
+
+    def gains(self, context):
+        """(..., J, 2) stiffness and damping scales of every joint."""
+        xi = self.xi(context)
+        return torch.stack((xi[..., self.stiffness], xi[..., self.damping]), -1).exp()
+
+    def orientation_bias(self, context):
+        """(..., 3) roll, pitch and yaw error of the robot's orientation estimate [rad]."""
+        return self.xi(context)[..., self.bias]
 
     def model(self, context):
         """The normalized physical parameters, without the platform positions."""
@@ -55,7 +76,8 @@ class ContextLayout:
 
 class Randomizer:
     """Samples the randomized parameters and applies the robot's part to the simulator. Disabled:
-    robot friction 1, no offsets, nominal object mass and the middle of its friction range."""
+    robot friction 1, no offsets, nominal gains, no orientation bias, nominal object mass and the
+    middle of its friction range."""
 
     def __init__(self, robot: Robot, physics, layout: ContextLayout, objects: list[dict], enabled: bool,
                  mass_range=(0.5, 1.5)):  # fmt: skip
@@ -64,6 +86,7 @@ class Randomizer:
         self.xi = torch.zeros(N, layout.xi_dim, device=device)
         self.xi[:, layout.friction] = 1.0
         self.joint_offset = torch.full((robot.num_joints,), JOINT_OFFSET, device=device)
+        self.bias_range = torch.tensor(ORIENTATION_BIAS, device=device)
         self.object_mass = torch.tensor([o["mass"] for o in objects], device=device)
         self.object_friction = torch.tensor([o["friction"] for o in objects], device=device)
         self.mass_scale = torch.ones(N, device=device)
@@ -92,12 +115,16 @@ class Randomizer:
         sim.model.geom_friction[:, robot_geoms, 0] = self.xi[:, self.layout.friction]
 
     def resample(self, mask, objects):
-        """New encoder offsets, object mass and object friction for the worlds that start an episode
-        with the objects ``objects`` (N,)."""
+        """New per-episode parameters for the worlds that start an episode with the objects ``objects`` (N,)."""
         lo, hi = self.object_friction[objects].unbind(-1)
+        L = self.layout
         if self.enabled:
-            new = (2 * torch.rand_like(self.xi[:, self.layout.joint_offset]) - 1) * self.joint_offset
-            self.xi[:, self.layout.joint_offset] = torch.where(mask[:, None], new, self.xi[:, self.layout.joint_offset])
+            new = self.xi.clone()
+            new[:, L.joint_offset] = (2 * torch.rand_like(new[:, L.joint_offset]) - 1) * self.joint_offset
+            new[:, L.stiffness] = torch.empty_like(new[:, L.stiffness]).uniform_(*LOG_GAIN)
+            new[:, L.damping] = torch.empty_like(new[:, L.damping]).uniform_(*LOG_GAIN)
+            new[:, L.bias] = (2 * torch.rand_like(new[:, L.bias]) - 1) * self.bias_range
+            self.xi.copy_(torch.where(mask[:, None], new, self.xi))
             scale = torch.empty_like(self.mass_scale).uniform_(*self.mass_range)
             friction = lo + torch.rand_like(lo) * (hi - lo)
         else:
@@ -105,6 +132,10 @@ class Randomizer:
         self.mass_scale.copy_(torch.where(mask, scale, self.mass_scale))
         self.friction.copy_(torch.where(mask, friction, self.friction))
         self.mass.copy_(torch.where(mask, self.object_mass[objects] * scale, self.mass))
+
+    def gain_scale(self):
+        """(N, J, 2) stiffness and damping scales of every joint."""
+        return torch.stack((self.xi[:, self.layout.stiffness], self.xi[:, self.layout.damping]), -1).exp()
 
     def context(self, tables):
         """Full context rows for platform positions ``tables`` (N, 6)."""

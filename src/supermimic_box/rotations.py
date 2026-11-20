@@ -71,6 +71,13 @@ def axis_angle_to_mat(axis: torch.Tensor, angle: torch.Tensor) -> torch.Tensor:
     ).reshape(angle.shape + (3, 3))  # fmt: skip
 
 
+def euler_xyz_to_mat(rpy: torch.Tensor) -> torch.Tensor:
+    """Rotation (..., 3, 3) of roll, pitch, yaw angles (..., 3): R = Rz(yaw) Ry(pitch) Rx(roll)."""
+    axes = torch.eye(3, dtype=rpy.dtype, device=rpy.device)
+    rx, ry, rz = (axis_angle_to_mat(axes[i], rpy[..., i]) for i in range(3))
+    return rz @ ry @ rx
+
+
 def skew(v: torch.Tensor) -> torch.Tensor:
     x, y, z = v.unbind(-1)
     o = torch.zeros_like(x)

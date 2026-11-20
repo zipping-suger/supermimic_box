@@ -6,7 +6,8 @@ as numbers supplied by the caller: whether each contact channel (left foot, righ
 right hand) is on the object and whether each foot is on the ground, measured in simulation and
 predicted by the contact head in imagination. Distances to the box come from its analytic shape.
 
-The reward terms and their defaults are OmniContact's CFtrack rewards.
+The reward terms and their defaults are OmniContact's CFtrack rewards, plus terms for the gait:
+foot tracking, the reference's stance pattern and a cost on short swings.
 """
 
 from __future__ import annotations
@@ -15,7 +16,7 @@ import torch
 
 from . import robot as R
 from .motion import CONTROL_DT
-from .rotations import angle_squared, mat_to_6d, mm3, mv3, yaw_mat
+from .rotations import angle_squared, euler_xyz_to_mat, mat_to_6d, mm3, mv3, so3_exp, yaw_mat
 
 FAILURE_REASONS = ("anchor_position", "anchor_tilt", "object_position", "object_rotation", "end_height")
 SURFACE_SCALE = 0.02  # distance [m] on which the surface features resolve the contact band
@@ -71,11 +72,12 @@ class HOIMDP:
         self.table_top = torch.tensor([0.0, 0.0, table_half[2]], device=device)
         margin = 0.05 * (self.kin.q_hi - self.kin.q_lo)
         self.soft_lo, self.soft_hi = self.kin.q_lo + margin, self.kin.q_hi - margin
-        # Uniform noise half-widths on the head of the observation.
+        # Uniform noise half-widths on the proprioceptive head of the observation; the box features
+        # are computed from a noisy box pose instead.
         self.noise = torch.cat((
             torch.full((J,), R.NOISE_JOINT_POS), torch.full((J,), R.NOISE_JOINT_VEL), torch.full((3,), R.NOISE_ANG_VEL),
             torch.full((3,), R.NOISE_GRAVITY), torch.zeros(A), torch.full((6,), R.NOISE_REF_ORI),
-            torch.full((3,), R.NOISE_OBJECT_POS), torch.full((6,), R.NOISE_OBJECT_ORI))).to(device)  # fmt: skip
+            torch.full((3,), R.NOISE_ROOT_POS))).to(device)  # fmt: skip
         self.ends = torch.cat((self.feet, self.hands))
         self.thresholds = torch.tensor([cfg.term_anchor_pos, cfg.term_tilt, cfg.term_object_pos, cfg.term_object_rot,
                                         cfg.term_end_height], device=device)  # fmt: skip
@@ -98,11 +100,10 @@ class HOIMDP:
         return torch.cat((distance.clamp(-0.05, 0.3), torch.tanh(distance / SURFACE_SCALE),
                           mv3(heading_from_object.unsqueeze(-3), field[..., 1:])), -1).flatten(-2)  # fmt: skip
 
-    def box_corners(self, s, f):
-        """(..., 24) corners of the box relative to the root, in the root's heading frame."""
-        corners = s[6].unsqueeze(-2) + mv3(s[7].unsqueeze(-3), self.geometry.corners(self.motion.object_of(f)))
-        Ht = yaw_mat(s[1]).transpose(-1, -2).unsqueeze(-3)
-        return limit_norm(mv3(Ht, corners - s[0].unsqueeze(-2)), SIGHT).flatten(-2)
+    def box_corners(self, p, Ht, op, oR, f):
+        """(..., 24) corners of the box at pose (op, oR) relative to the root position ``p``, in the heading frame ``Ht``."""
+        corners = op.unsqueeze(-2) + mv3(oR.unsqueeze(-3), self.geometry.corners(self.motion.object_of(f)))
+        return limit_norm(mv3(Ht.unsqueeze(-3), corners - p.unsqueeze(-2)), SIGHT).flatten(-2)
 
     def table_features(self, s, context):
         """(..., 12) per platform, in the root's heading frame: its centre relative to the root and the
@@ -130,19 +131,32 @@ class HOIMDP:
         n = self.noise.numel()
         return torch.cat((obs[..., :n] + (2 * torch.rand_like(obs[..., :n]) - 1) * self.noise, obs[..., n:]), -1)
 
-    def obs(self, s, f, previous_action, context, fk=None):
-        """Noise-free actor observation of state ``s`` at reference frame ``f``."""
+    def observed_root(self, Rm, context):
+        """The robot's root orientation as its state estimate has it: the true one with the episode's bias."""
+        return mm3(euler_xyz_to_mat(self.layout.orientation_bias(context)), Rm)
+
+    def obs(self, s, f, previous_action, context, fk=None, noise: bool = False):
+        """Actor observation of state ``s`` at reference frame ``f``; with ``noise`` (and randomization on)
+        as the robot would sense it.
+
+        Only what a real robot can provide: joint encoders, the IMU (angular velocity, gravity), its
+        previous action, its pose relative to the reference (needs localization), the box pose (needs
+        mocap or vision; position, orientation and the corners of the known box, all from one noisy
+        pose) and the reference's contact flags. The first 3J + 6 entries are what SONIC reads.
+        """
         p, Rm, v, w, q, qd, op, oR, ov, ow = s
         m = self.motion
-        fk = self.fk(s) if fk is None else fk
-        Ht, Rt = yaw_mat(Rm).transpose(-1, -2), Rm.transpose(-1, -2)
-        return torch.cat((
-            q - self.layout.offsets(context) - self.controller.default, qd, mv3(Rt, w), -Rm[..., 2, :],
-            previous_action, mat_to_6d(mm3(Rt, m.root_R[f])),
-            limit_norm(mv3(Ht, op - p), SIGHT), mat_to_6d(mm3(Ht, oR)), mv3(Ht, ov - v), mv3(Ht, ow) * 0.25,
-            self.box_corners(s, f), m.key(f), m.contact[f],
-            # Global tracking error: observable even when robot and object drift together.
-            mv3(Ht, m.root_p[f] - p), self.surface_features(s, f, fk)), -1)  # fmt: skip
+        noise = noise and self.noisy
+        if noise:
+            op = op + (2 * torch.rand_like(op) - 1) * R.NOISE_OBJECT_POS
+            oR = mm3(so3_exp((2 * torch.rand_like(op) - 1) * R.NOISE_OBJECT_ORI), oR)
+        Rb = self.observed_root(Rm, context)
+        Ht, Rt = yaw_mat(Rb).transpose(-1, -2), Rm.transpose(-1, -2)
+        obs = torch.cat((
+            q - self.layout.offsets(context) - self.controller.default, qd, mv3(Rt, w), -Rm[..., 2, :], previous_action,
+            mat_to_6d(mm3(Rb.transpose(-1, -2), m.root_R[f])), mv3(Ht, m.root_p[f] - p),
+            limit_norm(mv3(Ht, op - p), SIGHT), mat_to_6d(mm3(Ht, oR)), self.box_corners(p, Ht, op, oR, f), m.contact[f]), -1)  # fmt: skip
+        return self.add_noise(obs) if noise else obs
 
     def initial_feet(self, like):
         """Feet of a fresh episode, shaped like ``like`` (..., 4): on the ground, and with enough air
@@ -157,8 +171,10 @@ class HOIMDP:
         body_error = mv3(Ht.unsqueeze(-3), m.body_p[f] - fk[0]).flatten(-2)
         feet = torch.cat((feet[..., :2], feet[..., 2:].clamp(max=2 * self.cfg.feet_air_time_threshold)), -1)
         object_error = torch.cat((mv3(Ht, m.object_p[f] - s[6]), mat_to_6d(mm3(s[7].transpose(-1, -2), m.object_R[f]))), -1)
+        # Privileged: what the actor cannot sense, from the true state.
+        box = torch.cat((mv3(Ht, s[8] - s[2]), mv3(Ht, s[9]) * 0.25, m.key(f), self.surface_features(s, f, fk)), -1)
         return torch.cat((self.obs(s, f, previous_action, context, fk), mv3(Ht, s[2]), m.root_p[f] - s[0], body_error,
-                          object_error, self.layout.model(context), self.table_features(s, context), goal, feet), -1)  # fmt: skip
+                          object_error, box, self.layout.model(context), self.table_features(s, context), goal, feet), -1)  # fmt: skip
 
     # ------------------------------------------------------------------ reward
     def reward(self, s, f, action, previous_action, contact, foot_contact, swing_shortfall, episode_start, context, fk=None):
@@ -199,7 +215,7 @@ class HOIMDP:
         previous_command = self.controller.command(previous_action, m.q[previous_frame])
         rate = torch.where(episode_start, 0.0, (command - previous_command).square().sum(-1))
         target = self.controller(action, qref, self.layout.offsets(context))
-        torque = self.controller.torque(target, q, qd)[..., self.controller.torque_joints]
+        torque = self.controller.torque(target, q, qd, self.layout.gains(context))[..., self.controller.torque_joints]
         limits = torch.relu(self.soft_lo - q) + torch.relu(q - self.soft_hi)
         foot_speed = bv[..., self.feet, :2].square().sum(-1).add(1e-8).sqrt()
         terms = {
@@ -214,6 +230,9 @@ class HOIMDP:
             "interact_pos": c.interact_pos * torch.exp(-e_interact_pos / tolerance**2).mean(-1),
             "interact_ori": c.interact_ori * torch.exp(-e_interact_ori / tolerance**2).mean(-1),
             "contact": c.contact * torch.exp(-(contact - m.contact[f]).square().mean(-1) / c.contact_std**2),
+            "foot_pos": c.foot_pos * torch.exp(
+                -(bp[..., self.feet, :] - rp[..., self.feet, :]).square().sum(-1).mean(-1) / c.foot_pos_std**2),
+            "stance": c.stance * torch.exp(-(foot_contact - m.stance[f]).square().mean(-1) / c.stance_std**2),
             "body_velocity": c.body_velocity * torch.exp(-(bv - m.body_v[f]).square().sum(-1).mean(-1)),
             "body_angular_velocity": c.body_angular_velocity * torch.exp(
                 -(bw - m.body_w[f]).square().sum(-1).mean(-1) / c.body_angvel_std**2),

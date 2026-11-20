@@ -11,7 +11,10 @@ from dataclasses import dataclass, field, fields
 class RewardConfig:
     """Reward weights/scales and termination thresholds. Every reward is scaled by the 0.02 s control step.
 
-    The bonuses and costs up to ``feet_slide`` are OmniContact's CFtrack rewards with its weights.
+    The bonuses up to ``contact`` and the costs up to ``joint_limit`` are OmniContact's CFtrack
+    rewards with its weights. OmniContact shapes the gait with an adversarial motion prior; here
+    the gait terms do it (foot tracking, the stance pattern, and costs on sliding feet and short
+    swings): without them the policy shuffles in short, low steps.
     """
 
     # Tracking bonuses: weight * exp(-error^2 / std^2).
@@ -37,6 +40,14 @@ class RewardConfig:
     contact_std: float = 1.0
     hand_contact_force: float = 5.0  # [N] above which a hand counts as on the object
     foot_object_force: float = 1.0  # [N] above which a foot counts as on the object
+    # Gait. Both feet in the world frame, with a tolerance that resolves a step's height.
+    foot_pos: float = 0.5
+    foot_pos_std: float = 0.1
+    # exp(-mean squared difference between each foot's measured or predicted contact with the
+    # ground and the reference's stance / std^2): in the air when the reference swings, planted
+    # when it stands.
+    stance: float = 0.5
+    stance_std: float = 0.5
     # Velocity tracking; not part of OmniContact's rewards.
     body_velocity: float = 0.0
     body_angular_velocity: float = 0.0
@@ -49,8 +60,8 @@ class RewardConfig:
     # Feet: horizontal speed of a foot on the ground, and the time by which a swing that just
     # ended fell short of ``feet_air_time_threshold`` seconds. A foot is on the ground while the
     # ground pushes on it with more than ``foot_contact_force`` newtons.
-    feet_slide: float = 0.1
-    feet_air_time: float = 0.0
+    feet_slide: float = 1.0  # OmniContact: 0.1
+    feet_air_time: float = 20.0
     feet_air_time_threshold: float = 0.3
     foot_contact_force: float = 1.0
     # Termination.
@@ -61,7 +72,8 @@ class RewardConfig:
     term_end_height: float = 0.25  # height error of a foot or hand
 
     BONUSES = ("anchor_pos", "anchor_ori", "body_pos", "body_ori", "hand_pos", "hand_ori", "object_pos", "object_ori",
-               "interact_pos", "interact_ori", "contact", "body_velocity", "body_angular_velocity", "object_velocity")  # fmt: skip
+               "interact_pos", "interact_ori", "contact", "foot_pos", "stance", "body_velocity", "body_angular_velocity",
+               "object_velocity")  # fmt: skip
     COSTS = ("action_rate", "torque", "joint_limit", "feet_slide", "feet_air_time")
 
     def validate(self):
@@ -71,7 +83,7 @@ class RewardConfig:
             if not math.isfinite(value) or value < 0:
                 raise ValueError(f"reward.{name} must be nonnegative and finite")
         for name in ("body_pos_std", "body_ori_std", "body_angvel_std", "object_pos_std", "object_ori_std", "interact_std",
-                     "contact_std", "feet_air_time_threshold", "foot_contact_force", "hand_contact_force", "foot_object_force"):  # fmt: skip
+                     "contact_std", "foot_pos_std", "stance_std", "feet_air_time_threshold", "foot_contact_force", "hand_contact_force", "foot_object_force"):  # fmt: skip
             if not getattr(self, name) > 0:
                 raise ValueError(f"reward.{name} must be positive")
 
@@ -91,6 +103,15 @@ class TrainConfig:
     # the default pose) or "residual" (around the reference pose, which only a full reference has).
     goal_mode: str = "flow"
     action_mode: str = "absolute"
+    # A frozen pre-trained tracker whose action the policy adds to: "" (none) or "sonic" (GEAR-SONIC,
+    # which follows the joint reference; the policy then learns only a residual). SONIC needs its
+    # own drive set, "sonic", in place of "omnicontact".
+    base_policy: str = ""
+    base_checkpoint: str = "data/sonic/last_ported.pt"
+    # With a base policy: scale of the residual on the leg and waist joints (1: as free as on the
+    # arms). A small value leaves locomotion and balance to the base; the arms handle the box.
+    leg_residual_scale: float = 1.0
+    drives: str = "omnicontact"
 
     # Simulation. A world draws a clip at every reset; num_envs is at least the number of objects.
     device: str = "cuda:0"
@@ -211,6 +232,12 @@ class TrainConfig:
             raise ValueError("Unsupported goal or action mode")
         if self.action_mode == "residual" and self.goal_mode != "full":
             raise ValueError("Residual actions need the full reference as the goal")
+        if self.base_policy not in ("", "sonic") or self.drives not in ("omnicontact", "sonic"):
+            raise ValueError("Unsupported base policy or drive set")
+        if self.base_policy == "sonic" and (self.action_mode != "absolute" or self.drives != "sonic" or self.history < 10):
+            raise ValueError("The SONIC base needs absolute actions, the sonic drive set and a history of at least 10 steps")
+        if not 0 <= self.leg_residual_scale <= 1:
+            raise ValueError("leg_residual_scale must be in [0, 1]")
         if not 0 < self.object_mass_range[0] <= self.object_mass_range[1]:
             raise ValueError("Invalid object mass range")
         probabilities = (self.reset_frame_zero_probability, self.reset_precontact_probability)

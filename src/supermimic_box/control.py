@@ -54,7 +54,10 @@ class Controller(nn.Module):
         """Normalized physical PD target, the world model's action input."""
         return (target - self.default) / self.scale
 
-    def torque(self, target, q, qd):
-        """PD torque (..., J) that the drives apply for ``target`` in the state (q, qd)."""
+    def torque(self, target, q, qd, scale=None):
+        """PD torque (..., J) that the drives apply for ``target`` in the state (q, qd). ``scale``
+        (..., J, 2): randomized stiffness and damping scales."""
         stiffness, damping, effort = self.gains.unbind(-1)
+        if scale is not None:
+            stiffness, damping = stiffness * scale[..., 0], damping * scale[..., 1]
         return torch.maximum(torch.minimum(stiffness * (target - q) - damping * qd, effort), -effort)

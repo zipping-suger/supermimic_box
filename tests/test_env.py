@@ -22,6 +22,10 @@ def test_reference_library(data, robot, registry, clips):
     assert m.contact[m.clip_start].sum() == 0
     per_clip = torch.stack([m.contact[a : b + 1].sum(0) for a, b in zip(m.clip_start, m.clip_end)])
     assert (per_clip[:, 2:] > 0).all() and (per_clip[:, :2] == 0).all()
+    # The reference stands on at least one foot nearly always, and its stance phases are not flicker.
+    assert m.stance.shape == (m.num_frames, 2) and (m.stance.sum(-1) > 0).float().mean() > 0.95
+    flips = (m.stance[1:] != m.stance[:-1]).float().sum(0) / (m.num_frames * 0.02)
+    assert (flips < 4).all()  # fewer than two steps per second and foot
     table, count = m.precontact_frames()
     for clip in range(3):
         frame = int(table[clip, 0])
@@ -45,9 +49,9 @@ def test_reset_reproduces_the_reference_and_rewards_peak_there(tiny_config):
     c = tiny_config.reward
     action = task.controller.reference_action(state[4])
     still = torch.zeros(env.N, 2)
-    reward, terms = mdp.reward(state, frames, action, action, m.contact[frames], still, still, torch.ones(env.N, dtype=torch.bool), env.context)
+    reward, terms = mdp.reward(state, frames, action, action, m.contact[frames], m.stance[frames], still, torch.ones(env.N, dtype=torch.bool), env.context)
     for name in ("anchor_pos", "anchor_ori", "body_pos", "body_ori", "hand_pos", "hand_ori", "object_pos", "object_ori",
-                 "interact_pos", "interact_ori", "contact"):  # fmt: skip
+                 "interact_pos", "interact_ori", "contact", "foot_pos", "stance"):  # fmt: skip
         assert torch.allclose(terms[name], torch.full((env.N,), getattr(c, name) * CONTROL_DT), atol=2e-4), name
     assert mdp.errors(state, frames).abs().max() < 2e-2 and not mdp.hard_termination(state, frames)[0].any()
     assert mdp.soft_termination(state, frames).max() < 1e-3

@@ -82,7 +82,8 @@ class HOIEnv:
         state, objects = m.ref_state(frames), m.object_of(frames)
         self.randomizer.resample(mask, objects)
         self.tables.copy_(torch.where(mask[:, None], m.tables(frames), self.tables))
-        self.physics.reset(mask, state, objects, self.tables, self.randomizer.mass_scale, self.randomizer.friction)
+        self.physics.reset(mask, state, objects, self.tables, self.randomizer.mass_scale, self.randomizer.friction,
+                           self.randomizer.gain_scale())
         self.context.copy_(torch.where(mask[:, None], self.randomizer.context(self.tables), self.context))
         self.f.copy_(torch.where(mask, frames, self.f))
         for value in (self.age, self.episode_return):
@@ -97,7 +98,7 @@ class HOIEnv:
         return self.observe_fn(self.physics.state(), self.f, self.previous_action, self.context)
 
     def observe_state(self, state, frame, previous_action, context):
-        return self.mdp.add_noise(self.mdp.obs(state, frame, previous_action, context))
+        return self.mdp.obs(state, frame, previous_action, context, noise=True)
 
     def transition_outputs(self, state, frame, action, previous_action, context, contact_force, foot_force, feet, episode_start):
         """Everything derived from the post-physics state in one fused tensor computation."""
@@ -108,7 +109,7 @@ class HOIEnv:
         fk = self.mdp.fk(state)
         reward, terms = self.mdp.reward(state, frame, action, previous_action, contact, foot_contact, shortfall, episode_start, context, fk)
         failure, reasons = self.mdp.hard_termination(state, frame, fk)
-        obs = self.mdp.add_noise(self.mdp.obs(state, frame, action, context, fk))
+        obs = self.mdp.obs(state, frame, action, context, fk, noise=True)
         return contact, foot_contact, feet1, reward, terms, failure, reasons, obs
 
     @torch.no_grad()
@@ -163,7 +164,7 @@ class Task:
 
 
 def make_task(cfg) -> Task:
-    robot = load_robot(cfg.robot_assets)
+    robot = load_robot(cfg.robot_assets, cfg.drives)
     registry, object_signature = load_registry(cfg.object_assets)
     motion = Motion(cfg.dataset, robot, registry["objects"], cfg.device, cfg.clips, cfg.goal_mode, cfg.split)
     if cfg.device.startswith("cuda"):

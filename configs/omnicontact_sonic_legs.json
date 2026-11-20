@@ -1,0 +1,25 @@
+{
+  "dataset": "data/omnicontact/clips",
+  "robot_assets": "data/robot",
+  "object_assets": "data/omnicontact/objects",
+  "split": "train",
+  "goal_mode": "flow",
+  "action_mode": "absolute",
+  "base_policy": "sonic",
+  "base_checkpoint": "data/sonic/last_ported.pt",
+  "drives": "sonic",
+  "reward": {
+    "foot_pos": 0.0,
+    "stance": 0.0,
+    "feet_air_time": 0.0,
+    "feet_slide": 0.1
+  },
+  "num_envs": 1024,
+  "wm_batch": 2048,
+  "pi_batch": 1024,
+  "iterations": 10000,
+  "save_every": 2500,
+  "lr_decay_ret": 0.9,
+  "log_dir": "logs/omnicontact_sonic_legs",
+  "leg_residual_scale": 0.15
+}

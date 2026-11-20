@@ -38,6 +38,14 @@ def clips(data):
     return [carry[0], next(n for n in names if n.startswith("push")), carry[1]]
 
 
+@pytest.fixture(scope="session")
+def sonic_checkpoint(data):
+    path = data / "sonic" / "last_ported.pt"
+    if not path.is_file():
+        pytest.skip("SONIC checkpoint not found at data/sonic/last_ported.pt")
+    return path
+
+
 @pytest.fixture
 def tiny_config(data, clips, tmp_path):
     """Three clips, four CPU worlds and very small networks."""
