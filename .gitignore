@@ -10,3 +10,4 @@ __pycache__/
 MUJOCO_LOG.TXT
 # Per-run records written by .claude/codex-run.sh
 /.codex-runs/
+/checkpoints/

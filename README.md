@@ -40,8 +40,8 @@ individual evaluations.
 | Test box position error, mean | 4.3 cm | 3.9 cm |
 
 "Randomized" runs the evaluation under the training randomization and observation noise (two
-seeds on test); the other rows are nominal. The two release checkpoints are
-`logs/release_scratch/last.pt` and `logs/release_sonic/last.pt`.
+seeds on test); the other rows are nominal. Both checkpoints are attached to the
+[v1.0 release](https://github.com/zipping-suger/supermimic_box/releases/tag/v1.0).
 
 
 
@@ -136,6 +136,10 @@ Without `--dataset`, `prepare` builds 16 local clips (4.9 min) from the two chec
 ## Usage
 
 ```bash
+# Download and evaluate the release checkpoints (the SONIC one also needs data/sonic/last_ported.pt)
+gh release download v1.0 --repo zipping-suger/supermimic_box --pattern "*.pt" --dir checkpoints
+uv run python -m supermimic_box.evaluate checkpoints/supermimic_box_sonic.pt --split test
+
 # Train the two release checkpoints
 uv run python -m supermimic_box.train --config configs/release_scratch.json
 uv run python -m supermimic_box.train --config configs/release_sonic.json
